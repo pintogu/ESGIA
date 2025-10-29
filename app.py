@@ -331,9 +331,9 @@ st.markdown(
 
 if files:
     results: List[ReportResult] = []
-    progress = st.progress(0.0, text="Analyzing...")
+    # Use an int 0-100 for broad Streamlit version compatibility\ntry:\n    progress = st.progress(0, text="Analyzing...")\nexcept TypeError:\n    # Older Streamlit versions may not support the `text` kwarg\n    progress = st.progress(0)
     for i, f in enumerate(files):
-        progress.progress((i + 1) / len(files), text=f"Analyzing {f.name} ({i+1}/{len(files)})")
+        pct = int(100 * (i + 1) / len(files))\ntry:\n    progress.progress(pct, text=f"Analyzing {f.name} ({i+1}/{len(files)})")\nexcept TypeError:\n    progress.progress(pct)
         data = f.read()
         res = analyze_report(f.name, data)
         results.append(res)
@@ -467,3 +467,4 @@ else:
 # - Calibrate scoring with a gold dataset; normalize by sector (GICS/NAICS) using peer medians.
 # - Add an explainability panel that shows which sentences most influenced each pillar score.
 # - Persist results to a database and allow time-series tracking across years.
+
