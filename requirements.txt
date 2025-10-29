@@ -1,0 +1,12 @@
+streamlit>=1.37
+pandas>=2.1
+numpy>=1.26
+plotly>=5.24
+pymupdf>=1.24 # for fast PDF text extraction
+langdetect>=1.0.9 # lightweight language detection
+transformers>=4.43 # (optional) for zero-shot + translation
+sentencepiece>=0.2.0 # if you use MarianMT translation
+torch # if using transformers locally w/ PyTorch backend
+scikit-learn>=1.4
+python-dotenv>=1.0
+rapidfuzz>=3.9
