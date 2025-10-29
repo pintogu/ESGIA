@@ -333,11 +333,18 @@ if files:
     results: List[ReportResult] = []
     # Use an int 0-100 for broad Streamlit version compatibility\ntry:\n    progress = st.progress(0, text="Analyzing...")\nexcept TypeError:\n    # Older Streamlit versions may not support the `text` kwarg\n    progress = st.progress(0)
     for i, f in enumerate(files):
-        pct = int(100 * (i + 1) / len(files))\ntry:\n    progress.progress(pct, text=f"Analyzing {f.name} ({i+1}/{len(files)})")\nexcept TypeError:\n    progress.progress(pct)
+        pct = int(100 * (i + 1) / len(files))
+        try:
+            progress.progress(pct, text=f"Analyzing {f.name} ({i+1}/{len(files)})")
+        except TypeError:
+            progress.progress(pct)
+
         data = f.read()
         res = analyze_report(f.name, data)
         results.append(res)
+
     progress.empty()
+
 
     # ------- Overview table
     st.subheader("Overview & Ratings")
