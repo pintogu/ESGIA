@@ -331,7 +331,13 @@ st.markdown(
 
 if files:
     results: List[ReportResult] = []
-    # Use an int 0-100 for broad Streamlit version compatibility\ntry:\n    progress = st.progress(0, text="Analyzing...")\nexcept TypeError:\n    # Older Streamlit versions may not support the `text` kwarg\n    progress = st.progress(0)
+
+    # Initialize progress bar safely across Streamlit versions
+    try:
+        progress = st.progress(0, text="Analyzing...")
+    except TypeError:
+        progress = st.progress(0)
+
     for i, f in enumerate(files):
         pct = int(100 * (i + 1) / len(files))
         try:
@@ -343,7 +349,8 @@ if files:
         res = analyze_report(f.name, data)
         results.append(res)
 
-    progress.empty()
+    
+
 
 
     # ------- Overview table
