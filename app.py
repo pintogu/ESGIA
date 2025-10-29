@@ -226,7 +226,8 @@ def score_subtopics(text: str) -> Tuple[Dict[str, float], List[Tuple[str, str]]]
     for sub, seeds in SEEDS.items():
         hits = [s for s in sentences if any(re.search(rf"\b{re.escape(k)}\b", s, flags=re.I) for k in seeds)]
         # coverage as clipped density proxy
-        density = min(1.0, np.log1p(sum(count_seed_hits(" ".join(hits), seeds)) + 1) / 5)
+        hit_count = count_seed_hits(" ".join(hits), seeds)
+        density = float(min(1.0, np.log1p(hit_count + 1) / 5))
         coverage[sub] = float(density)
         # keep up to 3 highlights per subtopic
         for s in hits[:3]:
