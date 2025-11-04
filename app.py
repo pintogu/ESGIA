@@ -1,8 +1,9 @@
 """
-Streamlit ESG Analyzer
-======================
-Purpose: Upload one or more sustainability reports (any language), analyze content, and output
-homogeneous ESG ratings, comparable dashboards, and extracted risk highlights.
+Streamlit ESG Analyzer 
+===================================
+We built this app to quickly compare sustainability reports across firms and languages.
+Design goals: transparency, speed, and ease of deployment. We keep the scoring logic
+simple (seed coverage) but leave clear hooks for stronger NLP models when needed.
 
 How to run:
 -----------
@@ -16,11 +17,11 @@ streamlit>=1.37
 pandas>=2.1
 numpy>=1.26
 plotly>=5.24
-pymupdf>=1.24        # for fast PDF text extraction
+pymupdf>=1.24        # fast PDF text extraction
 langdetect>=1.0.9    # lightweight language detection
-transformers>=4.43   # (optional) for zero-shot + translation
-sentencepiece>=0.2.0 # if you use MarianMT translation
-torch                # if using transformers locally w/ PyTorch backend
+transformers>=4.43   # optional: zero-shot + translation
+sentencepiece>=0.2.0 # if MarianMT translation
+torch                # if using transformers locally
 scikit-learn>=1.4
 python-dotenv>=1.0
 rapidfuzz>=3.9
@@ -44,6 +45,8 @@ import plotly.graph_objects as go
 # -----------------------------
 # Optional / lazy-import blocks
 # -----------------------------
+# We keep transformers optional to avoid heavy startup time on light deployments.
+# The lazy check lets us degrade gracefully to seed-only scoring.
 
 def lazy_import_transformers():
     try:
@@ -57,6 +60,8 @@ TRANSFORMERS_OK = lazy_import_transformers()
 # -----------------------------
 # Configuration
 # -----------------------------
+# Streamlit layout + default weights. We expose weights in the UI so users can
+# align the scoring with their internal methodology. We normalize to sum to 1.
 
 st.set_page_config(
     page_title="ESG Analyzer",
@@ -69,12 +74,15 @@ DEFAULT_WEIGHTS = {
     "G": 0.3,
 }
 
+# Subtopic structure per pillar. These are deliberately simple and explainable.
+# In future iterations we plan to map to CSRD/GRI/SASB tags.
 SUBWEIGHTS = {
     "E": {"Emissions": 0.5, "Resources": 0.3, "Pollution": 0.2},
     "S": {"Labor": 0.4, "Community": 0.3, "Product": 0.3},
     "G": {"Board": 0.4, "Ethics": 0.3, "RiskMgmt": 0.3},
 }
 
+# Risk taxonomy: broad buckets that we surface visually and via signals.
 RISK_BUCKETS = [
     "Physical climate risk",
     "Transition/regulatory risk",
@@ -84,7 +92,8 @@ RISK_BUCKETS = [
     "Data quality/greenwashing risk",
 ]
 
-# Simple keyword seeds per sub-topic (expand / fine-tune for your use case)
+# Seed lexicons. We prefer clear keyword coverage to keep things auditable.
+# These are intentionally lightweight; teams can expand per sector.
 SEEDS = {
     "Emissions": ["emission", "ghg", "scope 1", "scope 2", "scope 3", "carbon", "co2"],
     "Resources": ["energy", "renewable", "water", "waste", "recycling", "efficiency"],
@@ -106,11 +115,14 @@ RISK_SEEDS = {
     "Data quality/greenwashing risk": ["assurance", "restatement", "omission", "selective", "greenwash", "misleading"],
 }
 
+# Normalize common locale codes from detectors/providers.
 LANG_OVERRIDES = {"zh-cn": "zh", "zh-tw": "zh"}
 
 # -----------------------------
-# Utilities
+# Data structures
 # -----------------------------
+# Central result packet we pass through the UI. Keeping it explicit helps with
+# export and downstream integrations.
 
 @dataclass
 class ReportResult:
@@ -125,23 +137,33 @@ class ReportResult:
     risk_signals: Dict[str, float]  # risk bucket -> [0,100]
     highlights: List[Tuple[str, str]]  # (subtopic, sentence)
 
+# -----------------------------
+# Language utils
+# -----------------------------
 
 def normalize_lang(code: str) -> str:
+    """Normalize lang codes so we get stable behavior across detectors."""
     code = (code or "en").lower()
     return LANG_OVERRIDES.get(code, code)
 
 
 def detect_language(text: str) -> str:
+    """Lightweight language detection. If it fails, we default to English."""
     try:
         from langdetect import detect
         return normalize_lang(detect(text[:2000]))
     except Exception:
         return "en"
 
+# -----------------------------
+# Ingestion & preprocessing
+# -----------------------------
 
 @st.cache_data(show_spinner=False)
 def extract_text_from_pdf(file_bytes: bytes) -> str:
-    """Extract text using PyMuPDF; fall back to a trivial empty string on error."""
+    """Extract text via PyMuPDF. If a page fails, we warn and continue.
+    We intentionally keep OCR out-of-scope here to keep dependencies slim.
+    """
     try:
         import fitz  # PyMuPDF
         with fitz.open(stream=file_bytes, filetype="pdf") as doc:
@@ -156,8 +178,9 @@ def extract_text_from_pdf(file_bytes: bytes) -> str:
 
 
 def translate_text(text: str, src_lang: str, tgt_lang: str = "en") -> Tuple[str, bool]:
-    """Pluggable translation. Defaults to passthrough if English or transformers unavailable.
-    You can set USE_MARIAN_MT=true and a model name via ENV MARIAN_MODEL (e.g., 'Helsinki-NLP/opus-mt-mul-en').
+    """Optional translation pipeline. We default to pass-through to preserve speed.
+    If USE_MARIAN_MT=true, we load MarianMT once and translate in sentence chunks.
+    Returns (possibly translated text, translated_flag).
     """
     src_lang = normalize_lang(src_lang)
     if src_lang in ("en", ""):
@@ -178,15 +201,15 @@ def translate_text(text: str, src_lang: str, tgt_lang: str = "en") -> Tuple[str,
                 translated_chunks.extend(translated)
             return "\n".join(translated_chunks), True
         except Exception as e:
+            # We choose safety over brittleness: if translation fails, we proceed in source language.
             st.warning(f"Translation fallback (pass-through). Error: {e}")
             return text, False
     else:
-        # Hook up a commercial API here if desired; keep passthrough as default
         return text, False
 
 
 def chunk_text(text: str, max_tokens: int = 400) -> List[str]:
-    # Rough splitter by sentences; productionize as needed
+    """Simple sentence-based chunker to avoid overlong sequences in models."""
     sents = re.split(r"(?<=[\.!?])\s+", text)
     chunks, cur = [], []
     count = 0
@@ -204,12 +227,19 @@ def chunk_text(text: str, max_tokens: int = 400) -> List[str]:
 
 
 def simple_clean(text: str) -> str:
+    """Normalize whitespace and non-breaking spaces; avoid heavy normalization to keep traceability."""
     text = re.sub(r"\s+", " ", text)
     text = text.replace("\u00A0", " ")
     return text.strip()
 
+# -----------------------------
+# Scoring primitives
+# -----------------------------
 
 def count_seed_hits(text: str, seeds: List[str]) -> int:
+    """Count exact-ish keyword matches (case-insensitive, word-boundary).
+    Known limitation: won't catch morphology; acceptable for transparency.
+    """
     hits = 0
     low = text.lower()
     for kw in seeds:
@@ -218,25 +248,25 @@ def count_seed_hits(text: str, seeds: List[str]) -> int:
 
 
 def score_subtopics(text: str) -> Tuple[Dict[str, float], List[Tuple[str, str]]]:
-    """Return coverage per subtopic in [0,1] based on seed density and top highlights."""
-    # Split into sentences for highlighting
+    """Compute subtopic coverage in [0,1] via seed density; also collect highlights.
+    We cap via log to avoid long documents dominating purely by length.
+    """
     sentences = re.split(r"(?<=[\.!?])\s+", text)
     coverage = {}
     highlights: List[Tuple[str, str]] = []
     for sub, seeds in SEEDS.items():
         hits = [s for s in sentences if any(re.search(rf"\b{re.escape(k)}\b", s, flags=re.I) for k in seeds)]
-        # coverage as clipped density proxy
         hit_count = count_seed_hits(" ".join(hits), seeds)
         density = float(min(1.0, np.log1p(hit_count + 1) / 5))
         coverage[sub] = float(density)
-        # keep up to 3 highlights per subtopic
+        # We show a few sentences per subtopic to keep the UI readable.
         for s in hits[:3]:
             highlights.append((sub, s.strip()))
     return coverage, highlights
 
 
 def compute_pillar_scores(coverage: Dict[str, float]) -> Dict[str, float]:
-    # Weighted subtopic averages -> pillar score on 0..100
+    """Roll subtopic coverage up to pillar scores (0..100) using SUBWEIGHTS."""
     pillar_scores = {}
     for pillar, subs in SUBWEIGHTS.items():
         val = 0.0
@@ -247,30 +277,46 @@ def compute_pillar_scores(coverage: Dict[str, float]) -> Dict[str, float]:
 
 
 def compute_risk_signals(text: str) -> Dict[str, float]:
+    """Heuristic risk signal intensity per bucket (0..100) from seed counts.
+    This is a proxy signal; we keep the scale linear-ish for interpretability.
+    """
     risks: Dict[str, float] = {}
     for bucket, seeds in RISK_SEEDS.items():
         hits = count_seed_hits(text, seeds)
-        risks[bucket] = float(min(100.0, hits * 8.0))  # tune scaling
+        risks[bucket] = float(min(100.0, hits * 8.0))  # tune scaling if needed
     return risks
 
 
 def compute_overall(pillar_scores: Dict[str, float]) -> float:
+    """Weighted average of E/S/G pillar scores using DEFAULT_WEIGHTS."""
     return round(
         sum(DEFAULT_WEIGHTS[p] * pillar_scores.get(p, 0.0) for p in ["E", "S", "G"]), 2
     )
 
 
 def compute_confidence(coverage: Dict[str, float], token_count: int) -> float:
+    """Confidence combines mean coverage and doc length (log-scaled).
+    Rationale: more coverage + more text tends to reduce variance.
+    """
     cov = np.mean(list(coverage.values()) or [0])
     length_factor = min(1.0, np.log1p(max(1, token_count)) / 8)
     return float(round(100 * (0.6 * cov + 0.4 * length_factor), 2))
 
+# -----------------------------
+# Main analysis pipeline
+# -----------------------------
 
 @st.cache_data(show_spinner=False)
 def analyze_report(name: str, file_bytes: bytes) -> ReportResult:
+    """End-to-end analysis for one report:
+    - Extract text
+    - Detect + (optionally) translate
+    - Score subtopics, compute pillars, overall, risks, and confidence
+    We cache to avoid recomputation when toggling UI elements.
+    """
     raw_text = extract_text_from_pdf(file_bytes)
     if not raw_text:
-        raw_text = ""  # OCR placeholder if you integrate pytesseract
+        raw_text = ""  # OCR hook: integrate pytesseract here if desired
 
     lang = detect_language(raw_text)
     text_en, translated = translate_text(raw_text, lang, "en")
@@ -297,10 +343,11 @@ def analyze_report(name: str, file_bytes: bytes) -> ReportResult:
         highlights=highlights,
     )
 
-
 # -----------------------------
 # UI Components
 # -----------------------------
+# The UI is structured to (1) upload, (2) tune weights, (3) compare at a glance,
+# and (4) drill down with highlights. Exports are first-class to support workflows.
 
 st.title("🌍 ESG Analyzer: Multilingual Sustainability Report Scoring")
 
@@ -320,6 +367,7 @@ with st.sidebar:
     if abs(tot - 1.0) > 1e-6:
         st.info("Weights auto-normalized to sum to 1.0")
     total = max(1e-9, wE + wS + wG)
+    # We update globals to keep compute_overall consistent with user choices.
     DEFAULT_WEIGHTS.update({"E": wE / total, "S": wS / total, "G": wG / total})
 
     st.subheader("Export")
@@ -333,7 +381,7 @@ st.markdown(
 if files:
     results: List[ReportResult] = []
 
-    # Initialize progress bar safely across Streamlit versions
+    # Progress bar: we handle Streamlit API differences across versions.
     try:
         progress = st.progress(0, text="Analyzing...")
     except TypeError:
@@ -349,10 +397,6 @@ if files:
         data = f.read()
         res = analyze_report(f.name, data)
         results.append(res)
-
-    
-
-
 
     # ------- Overview table
     st.subheader("Overview & Ratings")
@@ -380,19 +424,19 @@ if files:
     sel = st.multiselect("Pick 2–5 reports to compare", choices, default=choices[: min(3, len(choices))])
 
     if len(sel) >= 1:
-        # Radar per report (E,S,G)
+        # Radar: E/S/G profile per report. We cap range at [0,100].
         radar_cols = ["E", "S", "G"]
         radar_df = df[df["Report"].isin(sel)][["Report"] + radar_cols]
         fig = go.Figure()
         categories = radar_cols
         for _, row in radar_df.iterrows():
             fig.add_trace(
-                go.Scatterpolar(r=row[radar_cols].tolist(), theta=categories, fill="toself", name=row["Report"]) 
+                go.Scatterpolar(r=row[radar_cols].tolist(), theta=categories, fill="toself", name=row["Report"])
             )
         fig.update_layout(polar=dict(radialaxis=dict(visible=True, range=[0, 100])), showlegend=True, height=500)
         st.plotly_chart(fig, use_container_width=True)
 
-        # Risk heatmap
+        # Risk heatmap: quick scan of risk signals across selected reports.
         risk_rows = []
         for r in results:
             if r.name in sel:
@@ -414,9 +458,11 @@ if files:
                 st.metric("Confidence", r.confidence)
                 st.write("**Language**:", r.language, "**Translated**:", "Yes" if r.translated else "No")
             with c2:
+                # Coverage bar: subtopic density proxy (0–1).
                 cov_df = pd.DataFrame({"Subtopic": list(r.coverage.keys()), "Coverage (0–1)": list(r.coverage.values())})
                 st.bar_chart(cov_df.set_index("Subtopic"))
             with c3:
+                # Pillar bar: final E/S/G post-weights.
                 p_df = pd.DataFrame({"Pillar": ["E", "S", "G"], "Score": [r.pillar_scores["E"], r.pillar_scores["S"], r.pillar_scores["G"]]})
                 st.bar_chart(p_df.set_index("Pillar"))
 
@@ -425,11 +471,13 @@ if files:
             st.bar_chart(r_df.set_index("Bucket"))
 
             st.markdown("**Source highlights (by subtopic)**")
+            # We limit to 30 lines to keep the UI skimmable.
             for sub, sent in r.highlights[:30]:
                 st.markdown(f"- **{sub}**: {sent}")
 
     # ------- Export
     if want_export:
+        # JSON: full structured output for programmatic use.
         out = {
             "results": [asdict(r) for r in results],
             "weights": DEFAULT_WEIGHTS,
@@ -442,6 +490,7 @@ if files:
             file_name="esg_analysis.json",
             mime="application/json",
         )
+        # CSV: flat view for spreadsheets / BI tools.
         flat_rows = []
         for r in results:
             base = {
@@ -452,10 +501,8 @@ if files:
                 "Overall": r.overall_score,
                 "Confidence": r.confidence,
             }
-            # Add pillars
             for k, v in r.pillar_scores.items():
                 base[f"{k}"] = v
-            # Add risks
             for k, v in r.risk_signals.items():
                 base[f"Risk::{k}"] = v
             flat_rows.append(base)
@@ -467,6 +514,7 @@ if files:
             mime="text/csv",
         )
 else:
+    # We surface capabilities and limits up front so users know what to expect.
     st.info("Upload one or more PDF reports to get started. Supported languages auto-detected; translation to English is optional and pluggable.")
 
 # -----------------------------
@@ -482,4 +530,5 @@ else:
 # - Calibrate scoring with a gold dataset; normalize by sector (GICS/NAICS) using peer medians.
 # - Add an explainability panel that shows which sentences most influenced each pillar score.
 # - Persist results to a database and allow time-series tracking across years.
+
 
